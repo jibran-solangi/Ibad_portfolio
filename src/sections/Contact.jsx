@@ -38,12 +38,30 @@ const STEPS = ['You send the brief', 'We map the hook & angle on a short call', 
 
 const ACCEPT_EXT = ['pdf', 'doc', 'docx', 'txt', 'rtf', 'pages', 'mp4', 'mov']
 const ACCEPT = ACCEPT_EXT.map((e) => `.${e}`).join(',')
-const MAX_MB = 10
+const MAX_MB = 25
 const MAX_BYTES = MAX_MB * 1024 * 1024
 const AREA_MAX = 320 // px — the message grows with its content up to here, then scrolls
 
-/** Formspree endpoint — set VITE_FORMSPREE_ID to override, otherwise the live form ID */
-const FORMSPREE_ID = import.meta.env.VITE_FORMSPREE_ID || 'xrpbdnre'
+// Forminit — a public form backend: the form ID is safe to ship (no API key, set the
+// form to Public in the Forminit dashboard). Override per environment only to point at
+// a different form: VITE_FORMINIT_ENDPOINT in .env / the host's env vars.
+const FORM_ENDPOINT = import.meta.env.VITE_FORMINIT_ENDPOINT || 'https://forminit.com/f/6rarkqafu4u'
+
+// UTM + ad click IDs, replicated from the Forminit SDK. We POST directly instead of
+// loading the SDK (2 KB, and it can't take our abort signal), so this is the one thing
+// it would otherwise have collected for us — added to the payload as `fi-tracking-*`.
+const TRACKING = {
+  utm_source: 'utmSource',
+  utm_medium: 'utmMedium',
+  utm_campaign: 'utmCampaign',
+  utm_term: 'utmTerm',
+  utm_content: 'utmContent',
+  gclid: 'gclid',
+  fbclid: 'fbclid',
+  msclkid: 'msclkid',
+  ttclid: 'ttclid',
+  twclid: 'twclid',
+}
 
 const EMAIL_RE = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/
 const REQUIRED = ['name', 'email', 'message']
@@ -87,17 +105,42 @@ function validate(data) {
 
 const firstName = (v) => String(v ?? '').trim().split(/\s+/)[0]
 
-/** Multipart payload — a real endpoint can take it as-is.
- *  Formspree's free plan rejects file uploads, so the brief file is sent as a
- *  reference (name + size) and the sender is nudged to share a link instead. */
+/**
+ * Multipart payload in Forminit's block format. Names are what Forminit reads, so the
+ * UI keeps `name`/`email`/… and we rename on the way out — must match the blocks defined
+ * on the form in the Forminit dashboard (see README › Contact form). FormData (not JSON)
+ * because it's the only path that carries the file upload.
+ */
 function buildPayload(form, file) {
-  const data = new FormData(form)
-  data.delete('brief') // never POST the file itself — see note above
-  if (file) {
-    data.append('brief_file', `${file.name} (${formatBytes(file.size)})`)
-    data.append('message', `${String(data.get('message') ?? '').trim()}\n\n[Attached brief: ${file.name} — shared via link]`)
+  const get = (n) => {
+    const el = form.elements.namedItem(n)
+    return el && 'value' in el ? el.value.trim() : ''
   }
-  data.append('source', 'portfolio/contact')
+  const first = firstName(get('name'))
+  const last = get('name').split(/\s+/).slice(1).join(' ')
+
+  const data = new FormData()
+  data.append('fi-sender-firstName', first)
+  if (last) data.append('fi-sender-lastName', last)
+  data.append('fi-sender-email', get('email'))
+  const company = get('company')
+  if (company) data.append('fi-sender-company', company)
+  data.append('fi-text-message', get('message'))
+
+  // Optional selects: only send a block once a choice is made, so an untouched
+  // `fi-radio-need` never submits the empty string as a value.
+  const need = get('need')
+  if (need) data.append('fi-radio-need', need)
+  const vol = get('volume')
+  if (vol) data.append('fi-select-volume', vol)
+
+  if (file) data.append('fi-file-brief', file, file.name)
+
+  const params = new URLSearchParams(window.location.search)
+  Object.entries(TRACKING).forEach(([param, name]) => {
+    const v = params.get(param)
+    if (v) data.append(`fi-tracking-${name}`, v)
+  })
   return data
 }
 
@@ -112,36 +155,28 @@ function buildSummary(data, file) {
 }
 
 /**
- * Transport — Formspree. `payload` is multipart FormData: name, email, company,
- * need, volume, message, brief (file), source and the `_gotcha` honeypot.
- * Set VITE_FORMSPREE_ID (from formspree.io → your form → Integration) via Vercel.
+ * Transport — POSTs the multipart brief to Forminit. The browser sets the multipart
+ * boundary itself, so no Content-Type here. Honours `signal` (an unmount mid-send
+ * rejects and `handleSubmit` bails). On a non-2xx it rejects with Forminit's own
+ * message when the body carries one, so a genuine validation error reads on screen
+ * rather than as a bare status code. Keep MAX_MB in sync with Forminit's 25 MB limit.
  */
-function sendBrief(payload, signal) {
-  if (!FORMSPREE_ID) {
-    return Promise.reject(new Error('Form endpoint not configured (VITE_FORMSPREE_ID missing).'))
-  }
-  return fetch(`https://formspree.io/f/${FORMSPREE_ID}`, {
+async function sendBrief(payload, signal) {
+  const res = await fetch(FORM_ENDPOINT, {
     method: 'POST',
     body: payload,
-    headers: { Accept: 'application/json' },
+    headers: { Accept: 'application/json' }, // mirrors the SDK; asks Forminit for a JSON error body
     signal,
   })
-    .then(async (res) => {
-      if (!res.ok) {
-        let detail = ''
-        try {
-          const body = await res.json()
-          detail = body?.errors?.map((e) => e.message).join(' ') ?? ''
-        } catch {
-          /* non-JSON error body — fall back to the status */
-        }
-        throw new Error(detail || `Send failed (${res.status})`)
-      }
-    })
-    .catch((err) => {
-      if (err?.name === 'AbortError') throw err
-      throw err instanceof Error ? err : new Error('Send failed')
-    })
+  if (res.ok) return
+  let message = `Send failed (${res.status})`
+  try {
+    const body = await res.json()
+    if (body?.message) message = body.message
+  } catch {
+    // non-JSON error body — keep the status-based message
+  }
+  throw new Error(message)
 }
 
 /* --------------------------------------------------------------------------
@@ -306,7 +341,7 @@ function Dropzone({ file, error, inputRef, onPick, onRemove, className = '' }) {
           or <span className="ct-drop__browse">browse your files</span>
         </span>
         <span id="ct-file-hint" className="ct-drop__hint t-mono">
-          PDF, DOC, TXT, RTF, Pages, MP4, MOV · Share a Drive/Dropbox link for big files
+          PDF, DOC, TXT, RTF, Pages, MP4, MOV · Max {MAX_MB} MB
         </span>
       </label>
 
@@ -655,7 +690,7 @@ export default function Contact() {
     if (!ACCEPT_EXT.includes(extOf(f.name))) {
       msg = `“${f.name}” isn’t a supported format. Use PDF, DOC, DOCX, TXT, RTF, Pages, MP4 or MOV.`
     } else if (f.size > MAX_BYTES) {
-      msg = `That file is ${formatBytes(f.size)} — too large to track here. Share a Drive or Dropbox link in the message instead.`
+      msg = `That file is ${formatBytes(f.size)} — the limit is ${MAX_MB} MB. Share a link in the message instead.`
     }
     if (msg) {
       setFileError(msg)
@@ -695,6 +730,8 @@ export default function Contact() {
     if (status !== 'idle') return
     const form = e.currentTarget
     const data = new FormData(form)
+    // Honeypot — a filled hidden field means a bot; drop it before the network call.
+    if (String(data.get('_gotcha') ?? '').trim()) return
     const next = validate(data)
     const invalid = REQUIRED.filter((k) => next[k])
     // commit aria-invalid + the error text before focus lands, so the field is announced with its message
@@ -722,12 +759,9 @@ export default function Contact() {
       await sendBrief(payload, ctrl.signal)
     } catch (err) {
       if (ctrl.signal.aborted) return
-      const msg = (() => {
-        const base = `That didn’t go through. Please try again, or email ${SITE.email}.`
-        return err instanceof Error && err.message && !/^(Send failed|Form endpoint)/.test(err.message)
-          ? `${base} (${err.message})`
-          : base
-      })()
+      // Forminit's own message (e.g. a rejected field) is more useful than a generic line
+      const why = err instanceof Error && err.message && !err.message.startsWith('Send failed') ? ` (${err.message})` : ''
+      const msg = `That didn’t go through. Please try again, or email ${SITE.email}.${why}`
       setStatus('idle')
       setSendError(msg)
       announce(msg)
@@ -945,7 +979,7 @@ export default function Contact() {
                     onRemove={removeFile}
                   />
 
-                  {/* Honeypot — people never see it; providers like Formspree drop anything that fills it */}
+                  {/* Honeypot — people never see it; a bot that fills it is dropped in handleSubmit */}
                   <div className="ct-hp" aria-hidden="true">
                     <label htmlFor="ct-gotcha">Leave this field empty</label>
                     <input id="ct-gotcha" type="text" name="_gotcha" tabIndex={-1} autoComplete="off" />

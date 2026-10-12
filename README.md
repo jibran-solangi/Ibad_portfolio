@@ -42,7 +42,26 @@ npm run preview  # serve the build
 
 ## Contact form
 
-The form validates and shows a success state but does not send anything yet. Wire it to your form backend (Formspree, Resend, a serverless function…) where the `TODO` is in `src/sections/Contact.jsx` — the payload is already built as `FormData`, including the optional brief upload.
+The form POSTs the brief to [Forminit](https://forminit.com) as multipart `FormData` — `src/sections/Contact.jsx` (`buildPayload` + `sendBrief`). It targets the form **`6rarkqafu4u`** (`https://forminit.com/f/6rarkqafu4u`), hardcoded so there is nothing to configure; set `VITE_FORMINIT_ENDPOINT` in `.env` / the host's env vars only to point a deployment at a different form.
+
+Forminit is a *public* form backend — the form ID is safe to ship, no API key. Keep the form set to **Public** in the Forminit dashboard.
+
+Fields are sent in Forminit's block format, and **the names must match the blocks defined on the form** or the submission arrives empty:
+
+| Form field | Forminit block |
+| --- | --- |
+| Name | `fi-sender-firstName` (+ `fi-sender-lastName`, split on the first space) |
+| Email | `fi-sender-email` |
+| Company / Brand | `fi-sender-company` |
+| What do you need? | `fi-radio-need` |
+| Monthly volume | `fi-select-volume` |
+| Message | `fi-text-message` |
+| Brief / script | `fi-file-brief` |
+| URL UTM + click IDs | `fi-tracking-*` |
+
+The site POSTs directly rather than loading the Forminit SDK — the SDK's only client-side value is UTM/click-id capture, which `TRACKING` in `Contact.jsx` replicates, and this keeps the request cancellable on unmount. Keep `MAX_MB` in sync with Forminit's 25 MB upload limit.
+
+Requires a `.env` with `VITE_FORMINIT_ENDPOINT` unset (the default is fine) — see `.env.example`.
 
 ## Motion & accessibility
 
